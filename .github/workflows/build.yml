@@ -1,164 +1,196 @@
 name: Build a kernel with KernelSU patched and SuSFS
+
+env:
+  OUT_DIR: ${{ github.workspace }}/out
+  BUILD_DATE: ${{ github.run_id }}-$(date +'%Y%m%d')
+
 on:
-    workflow_dispatch:
-        # Various inputs to simplify usage of workflow.
-        inputs:
-            KSU_GIT:
-                description: 'Link to the git repository of the KernelSU variant (leave it be for KernelSU-Next or if unsure):'
-                required: false
-                default: 'https://github.com/KernelSU-Next/KernelSU-Next.git'
-            KSU_GIT_BRANCH:
-                description: 'Preferred branch of the preferred KernelSU git repository (leave it be for KernelSU-Next, otherwise must define):'
-                required: false
-                default: 'next'
-            INCLUDE_SUSFS:
-                type: choice
-                description: 'Would you like to build the kernel with SuSFS (leave it be if unsure)?'
-                required: false
-                default: 'No'
-                options:
-                    - 'Yes'
-                    - 'No'
-            KERNEL_GIT:
-                description: 'Link to the git repository of your preferred kernel source:'
-                required: true
-            KERNEL_GIT_BRANCH:
-                description: 'Preferred branch of the kernel source git repository:'
-                required: true
-            KERNEL_ARCH:
-                type: choice
-                description: 'Kernel architecture (seperate from Android architecture):'
-                required: true
-                options:
-                    - 'arm64'
-                    - 'arm'
-            KERNEL_COMPILER:
-                type: choice
-                description: 'Which compiler would you like to use?'
-                required: true
-                options:
-                    - 'Clang/LLVM'
-                    - 'GCC/Binutils'
-            KERNEL_CONFIGS:
-                description: 'Space-seperated list of kernel configs your designated device requires by order (!IMPORTANT AND DANGEROUS!):'
-                required: true
-            KERNEL_LOCALVERSION:
-                description: 'Suffix for your kernel version (must not contain spaces, leave blank if unsure):'
-                required: false
-            #KERNEL_EXTRA_CONFIGS:
-            #    description: 'Extra kernel configuration lines (!USE AT YOUR OWN RISK!, leave blank if unsure, please):'
-            #    required: false
+  workflow_dispatch:
+    inputs:
+      KSU_GIT:
+        description: 'Link to KernelSU git repo (default KernelSU-Next):'
+        required: false
+        default: 'https://github.com/KernelSU-Next/KernelSU-Next.git'
+      KSU_GIT_BRANCH:
+        description: 'KernelSU git branch (default "next"):'
+        required: false
+        default: 'next'
+      INCLUDE_SUSFS:
+        type: choice
+        description: 'Build with SuSFS?'
+        required: false
+        default: 'No'
+        options:
+          - 'Yes'
+          - 'No'
+      KERNEL_GIT:
+        description: 'Kernel source git repo:'
+        required: true
+      KERNEL_GIT_BRANCH:
+        description: 'Kernel source git branch:'
+        required: true
+      KERNEL_ARCH:
+        type: choice
+        description: 'Kernel architecture:'
+        required: true
+        options:
+          - 'arm64'
+          - 'arm'
+      KERNEL_COMPILER:
+        type: choice
+        description: 'Compiler choice:'
+        required: true
+        options:
+          - 'Clang/LLVM'
+          - 'GCC/Binutils'
+      KERNEL_CONFIGS:
+        description: 'Space-separated kernel configs (IMPORTANT):'
+        required: true
+      KERNEL_LOCALVERSION:
+        description: 'Kernel version suffix (no spaces):'
+        required: false
+      CREATE_RELEASE:
+        description: 'Create GitHub Release?'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
-    build:
-        runs-on: ubuntu-latest
-        steps:
-        - name: Checkout Repository
-          uses: actions/checkout@v4
-          with:
-           fetch-depth: 0
+  build:
+    runs-on: ubuntu-latest
+    env:
+      OUT_DIR: ${{ env.OUT_DIR }}
+      BUILD_DATE: ${{ github.run_number }}-${{ github.run_id }}-$(date +'%Y%m%d')
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-        - name: 'Setup dependencies and environment'
-          run: |
-            sudo cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources~
-            sudo sed -Ei 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
-            sudo apt-get update -y
+      - name: Setup dependencies and environment
+        run: |
+          sudo cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources~
+          sudo sed -Ei 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update -y
+          # Build essentials and tools from example + your original deps
+          sudo apt-get install -y build-essential bc curl zip ftp gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf libssl-dev lftp zstd libfl-dev python2 python3 libarchive-tools
+          # Your original deps
+          sudo apt build-dep -y linux
+          # LLVM & Clang setup
+          wget https://apt.llvm.org/llvm.sh
+          chmod a+x llvm.sh
+          sudo ./llvm.sh 20
+          # Coccinelle build
+          sudo apt-get build-dep -y coccinelle
+          git clone --depth=1 https://github.com/coccinelle/coccinelle.git
+          cd ./coccinelle/
+          ./autogen
+          ./configure
+          make -j$(nproc --all)
+          sudo make -j$(nproc --all) install
+          cd ..
 
-            # Install kernel build dependencies
-            sudo apt build-dep -y linux
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 ${{ github.event.inputs.KERNEL_GIT }} -b ${{ github.event.inputs.KERNEL_GIT_BRANCH }} ./kernel-src
 
-            # Install clang and LLVM
-            wget https://apt.llvm.org/llvm.sh
-            chmod a+x llvm.sh
-            sudo ./llvm.sh 20
+      - name: Clone any submodules if present
+        working-directory: ./kernel-src
+        run: |
+          git submodule init && git submodule update
 
-            # Install GCC for aarch64 and arm(32)
-            sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+      - name: Patch KernelSU repository into kernel source
+        working-directory: ./kernel-src
+        run: |
+          [ -L "drivers/kernelsu" ] && rm "drivers/kernelsu" && echo "[-] Symlink removed."
+          grep -q "kernelsu" ./drivers/Makefile && sed -i '/kernelsu/d' ./drivers/Makefile && echo "[-] Makefile reverted."
+          grep -q "drivers/kernelsu/Kconfig" ./drivers/Kconfig && sed -i '/drivers\/kernelsu\/Kconfig/d' ./drivers/Kconfig && echo "[-] Kconfig reverted."
+          if [ -d "./KernelSU*" ]; then rm -rf ./KernelSU* && echo "[-] KernelSU directory deleted."; fi
+          git submodule add --force -b ${{ github.event.inputs.KSU_GIT_BRANCH }} ${{ github.event.inputs.KSU_GIT }} ./KernelSU
+          ln -sf ../KernelSU/kernel ./drivers/kernelsu
+          grep -q "kernelsu" ./drivers/Makefile || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> ./drivers/Makefile && echo "[+] Modified Makefile."
+          grep -q "source \"drivers/kernelsu/Kconfig\"" ./drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" ./drivers/Kconfig && echo "[+] Modified Kconfig."
+          echo '[+] Done.'
 
-            # Compile and install coccinelle
-            sudo apt-get build-dep -y coccinelle
-            git clone --depth=1 https://github.com/coccinelle/coccinelle.git
-            cd ./coccinelle/
-            ./autogen
-            ./configure
-            make -j$(nproc --all)
-            sudo make -j$(nproc --all) install
+      - name: Patch KernelSU manual scope-minimized hooks
+        working-directory: ./kernel-src
+        run: |
+          git clone --depth=1 https://github.com/devnoname120/kernelsu-coccinelle.git
+          for p in fs drivers/input drivers/tty arch/arm/kernel; do
+            spatch --sp-file ./kernelsu-coccinelle/scope-minimized-hooks/kernelsu-scope-minimized.cocci --in-place --linux-spacing "$p"
+          done
+          rm -rf ./kernelsu-coccinelle
 
-        - name: 'Clone kernel source'
-          run: |
-            git clone --depth=1 ${{ github.event.inputs.KERNEL_GIT }} -b ${{ github.event.inputs.KERNEL_GIT_BRANCH }} ./kernel-src
-
-        - name: 'Clone any submodules if present'
-          working-directory: './kernel-src'
-          run: |
-            git submodule init; git submodule update
-
-        - name: 'Patch KernelSU repository into the kernel source'
-          working-directory: './kernel-src'
-          run: |
-            # Revert any old KernelSU patches
-            [ -L "drivers/kernelsu" ] && rm "drivers/kernelsu" && echo "[-] Symlink removed."
-            grep -q "kernelsu" "./drivers/Makefile" && sed -i '/kernelsu/d' "./drivers/Makefile" && echo "[-] Makefile reverted."
-            grep -q "drivers/kernelsu/Kconfig" "./drivers/Kconfig" && sed -i '/drivers\/kernelsu\/Kconfig/d' "./drivers/Kconfig" && echo "[-] Kconfig reverted."
-            if [ -d "./KernelSU*" ]; then
-                rm -rf "./KernelSU*" && echo "[-] KernelSU directory deleted."
-            fi
-
-            # Clone the KernelSU repository
-            git submodule add --force -b ${{ github.event.inputs.KSU_GIT_BRANCH }} ${{ github.event.inputs.KSU_GIT }} ./KernelSU
-
-            # Apply KernelSU patches
-            ln -sf ../KernelSU/kernel ./drivers/kernelsu
-            grep -q "kernelsu" "./drivers/Makefile" || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "./drivers/Makefile" && echo "[+] Modified Makefile."
-            grep -q "source \"drivers/kernelsu/Kconfig\"" "./drivers/Kconfig" || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" "./drivers/Kconfig" && echo "[+] Modified Kconfig."
-            echo '[+] Done.'
-
-        - name: 'Patch KernelSU manual scope-minimized hooks into the kernel source'
-          working-directory: './kernel-src'
-          run: |
-            # Clone the repository which contains the patch
-            git clone --depth=1 https://github.com/devnoname120/kernelsu-coccinelle.git
-
-            # Patch the kernel source with scope-minimized hooks
-            for p in fs drivers/input drivers/tty arch/arm/kernel; do spatch --sp-file ./kernelsu-coccinelle/scope-minimized-hooks/kernelsu-scope-minimized.cocci --in-place --linux-spacing "$p"; done
-
-            # Cleanup
-            rm -rf ./kernelsu-coccinelle
-
-        - name: 'Generate the kernel .config file'
-          working-directory: './kernel-src'
-          run: |
-            # Generate kernel config using make
-            if [ ${{ github.event.inputs.KERNEL_COMPILER }} == 'Clang/LLVM' ]; then
-                make ARCH=${{ github.event.inputs.KERNEL_ARCH }} CC=clang-20 LLVM=-20 LLVM_IAS=1 LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=out ${{ github.event.inputs.KERNEL_CONFIGS }}
-            fi
-
-            if [ ${{ github.event.inputs.KERNEL_ARCH }} == 'arm' ]; then
-                if [ ${{ github.event.inputs.KERNEL_COMPILER }} == 'GCC/Binutils' ]; then
-                    make ARCH=${{ github.event.inputs.KERNEL_ARCH }} CC=arm-linux-gnueabihf-gcc CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=out ${{ github.event.inputs.KERNEL_CONFIGS }}
-                fi
+      - name: Generate the kernel .config file
+        working-directory: ./kernel-src
+        run: |
+          mkdir -p $OUT_DIR
+          if [ "${{ github.event.inputs.KERNEL_COMPILER }}" = "Clang/LLVM" ]; then
+            make ARCH=${{ github.event.inputs.KERNEL_ARCH }} CC=clang-20 LLVM=-20 LLVM_IAS=1 LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=$OUT_DIR ${{ github.event.inputs.KERNEL_CONFIGS }}
+          elif [ "${{ github.event.inputs.KERNEL_COMPILER }}" = "GCC/Binutils" ]; then
+            if [ "${{ github.event.inputs.KERNEL_ARCH }}" = "arm" ]; then
+              make ARCH=arm CC=arm-linux-gnueabihf-gcc CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=$OUT_DIR ${{ github.event.inputs.KERNEL_CONFIGS }}
             else
-                if [ ${{ github.event.inputs.KERNEL_COMPILER }} == 'GCC/Binutils' ]; then
-                    make ARCH=${{ github.event.inputs.KERNEL_ARCH }} CC=aarch64-linux-gnu-gcc CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=out ${{ github.event.inputs.KERNEL_CONFIGS }}
-                fi
+              make ARCH=arm64 CC=aarch64-linux-gnu-gcc CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=$OUT_DIR ${{ github.event.inputs.KERNEL_CONFIGS }}
             fi
+          fi
+          echo 'CONFIG_KSU_KPROBES_HOOK=n' >> $OUT_DIR/.config
 
-            echo 'CONFIG_KSU_KPROBES_HOOK=n' >> out/.config
-
-        - name: 'Build kernel'
-          working-directory: './kernel-src'
-          run: |
-            # Compile using make
-            if [ ${{ github.event.inputs.KERNEL_COMPILER }} == 'Clang/LLVM' ]; then
-                make ARCH=${{ github.event.inputs.KERNEL_ARCH }} CC=clang-20 LLVM=-20 LLVM_IAS=1 LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=out
-            fi
-
-            if [ ${{ github.event.inputs.KERNEL_ARCH }} == 'arm' ]; then
-                if [ ${{ github.event.inputs.KERNEL_COMPILER }} == 'GCC/Binutils' ]; then
-                    make ARCH=${{ github.event.inputs.KERNEL_ARCH }} CC=arm-linux-gnueabihf-gcc CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=out
-                fi
+      - name: Build kernel
+        working-directory: ./kernel-src
+        run: |
+          if [ "${{ github.event.inputs.KERNEL_COMPILER }}" = "Clang/LLVM" ]; then
+            make ARCH=${{ github.event.inputs.KERNEL_ARCH }} CC=clang-20 LLVM=-20 LLVM_IAS=1 LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=$OUT_DIR
+          elif [ "${{ github.event.inputs.KERNEL_COMPILER }}" = "GCC/Binutils" ]; then
+            if [ "${{ github.event.inputs.KERNEL_ARCH }}" = "arm" ]; then
+              make ARCH=arm CC=arm-linux-gnueabihf-gcc CROSS_COMPILE=arm-linux-gnueabihf- LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=$OUT_DIR
             else
-                if [ ${{ github.event.inputs.KERNEL_COMPILER }} == 'GCC/Binutils' ]; then
-                    make ARCH=${{ github.event.inputs.KERNEL_ARCH }} CC=aarch64-linux-gnu-gcc CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=out
-                fi
+              make ARCH=arm64 CC=aarch64-linux-gnu-gcc CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=${{ github.event.inputs.KERNEL_LOCALVERSION }} -j$(nproc --all) O=$OUT_DIR
             fi
+          fi
+
+      - name: Upload kernel Image
+        uses: actions/upload-artifact@v3
+        with:
+          name: Image-${{ github.event.inputs.KERNEL_ARCH }}-${{ github.run_number }}-${{ github.run_id }}
+          path: ${{ env.OUT_DIR }}/arch/${{ github.event.inputs.KERNEL_ARCH }}/boot/Image
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload kernel Image.gz
+        uses: actions/upload-artifact@v3
+        with:
+          name: Image.gz-${{ github.event.inputs.KERNEL_ARCH }}-${{ github.run_number }}-${{ github.run_id }}
+          path: ${{ env.OUT_DIR }}/arch/${{ github.event.inputs.KERNEL_ARCH }}/boot/Image.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload dtb
+        uses: actions/upload-artifact@v3
+        with:
+          name: dtb-${{ github.event.inputs.KERNEL_ARCH }}-${{ github.run_number }}-${{ github.run_id }}
+          path: ${{ env.OUT_DIR }}/arch/${{ github.event.inputs.KERNEL_ARCH }}/boot/dtb
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload dtbo.img
+        uses: actions/upload-artifact@v3
+        with:
+          name: dtbo.img-${{ github.event.inputs.KERNEL_ARCH }}-${{ github.run_number }}-${{ github.run_id }}
+          path: ${{ env.OUT_DIR }}/arch/${{ github.event.inputs.KERNEL_ARCH }}/boot/dtbo.img
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.CREATE_RELEASE == 'true' }}
+        uses: softprops/action-gh-release@v1
+        continue-on-error: true
+        with:
+          tag_name: "v${{ github.run_number }}-${{ github.run_id }}"
+          name: "Kernel Build v${{ github.run_number }}-${{ github.run_id }}"
+          body: "Automated kernel build with KernelSU and SuSFS support"
+          files: |
+            ${{ env.OUT_DIR }}/arch/${{ github.event.inputs.KERNEL_ARCH }}/boot/Image
+            ${{ env.OUT_DIR }}/arch/${{ github.event.inputs.KERNEL_ARCH }}/boot/Image.gz
+            ${{ env.OUT_DIR }}/arch/${{ github.event.inputs.KERNEL_ARCH }}/boot/dtb
+            ${{ env.OUT_DIR }}/arch/${{ github.event.inputs.KERNEL_ARCH }}/boot/dtbo.img
